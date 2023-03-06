@@ -1,13 +1,11 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from datetime import date
-from loguru import logger
 from typing import List
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import HTTPException, Depends
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sqlalchemy import create_engine
 from datetime import datetime
 import catboost as ctb
@@ -28,27 +26,27 @@ class Response(BaseModel):
     exp_group: str
     recommendations: List[PostGet]
 
+
+# Functions for model loading
+
 def get_model_path(path: str) -> str:
-    if os.environ.get("IS_LMS") == "1":  # проверяем где выполняется код в лмс, или локально. Немного магии
+    if os.environ.get("IS_LMS") == "1":  # Checking if code is is executed in LMS or locally. 
         MODEL_PATH = '/workdir/user_input/model'
     else:
         MODEL_PATH = path
- #       MODEL_PATH = 'C:/Users/Andrey Grigorovich/Final/catboost_model'
+ #       MODEL_PATH = 'C:/Projects/Final/catboost_model'
     return MODEL_PATH
     
-# "catboost_model"
-
 def load_models():
     model_path = get_model_path("/my/super/path")
-    CTB = ctb.CatBoostClassifier()  # здесь не указываем параметры, которые были при обучении, в дампе модели все есть
+    CTB = ctb.CatBoostClassifier() 
     CTB.load_model(model_path)
     return CTB
 
-
-
-
 model = load_models()
 
+
+# Functions for loading data in chunks
 
 def batch_load_sql(query: str) -> pd.DataFrame:
     CHUNKSIZE = 20000
@@ -58,7 +56,6 @@ def batch_load_sql(query: str) -> pd.DataFrame:
     )
     conn = engine.connect().execution_options(stream_results=True)
     chunks = []
-
     
     for chunk_dataframe in pd.read_sql(query, conn, chunksize=CHUNKSIZE):
         chunks.append(chunk_dataframe)
@@ -66,18 +63,18 @@ def batch_load_sql(query: str) -> pd.DataFrame:
 
     conn.close()
     return pd.concat(chunks, ignore_index=True)
-    
   
     
 def load_features(quary: str) -> pd.DataFrame:
     return batch_load_sql(quary)
 
 
-# Preparation table with watched posts
+# Loading DataFrames
+
 start_time = time.time()
 print('Loading watched posts...')
 df_watched = load_features("""SELECT user_id, posts FROM scetch_watched_posts_lesson_22""")
-print('Watch posts loaded')
+print('Watched posts loaded')
 print("--- %s seconds ---" % (time.time() - start_time))
 
 start_time = time.time()
@@ -93,17 +90,17 @@ print('Posts loaded')
 print("--- %s seconds ---" % (time.time() - start_time))
 
 df_watched.set_index('user_id', inplace=True)
-#cols = ['hour', 'dayofweek', 'timestamp_delta', 'counter', 'gender', 'age', 'country', 'city', 'exp_group', 'topic', 'tfidf', 'watched_month', 'top_month']
-cols = ['gender', 'age', 'country', 'city', 'exp_group', 'topic', 'tfidf', 'watched_month', 'top_month', 'hour', 'dayofweek', 'timestamp_delta', 'counter', 'delta']
-print('...Finish loading')
+#cols = ['hour', 'dayofweek', 'timestamp_delta', 'counter', 'gender', 'age', 'country', 'city', 'exp_group', 'topic', 'lst_topic', 'max_topic','tfidf', 'watched_month', 'top_month']
+cols = ['hour', 'dayofweek', 'timestamp_delta', 'counter', 'gender', 'age', 'country', 'city', 'exp_group', 'topic', 'tfidf', 'watched_month', 'top_month']
+print('...DataFrames loading COMPLETED')
       
       
 @app.get('/post/recommendations', response_model=List[PostGet])
-def recommended_posts(id: int, time: datetime=datetime.now(), limit: int = 5) -> List[PostGet]:
+def recommended_posts(id: int, time: datetime, limit: int = 5) -> List[PostGet]:
     
     if id not in df_user['user_id'].values:
         
-        posts = df_posts[['post_id', 'text', 'topic', 'top_month']].sort_values('top_month', ascending=False).reset_index().drop('index', axis=1) 
+        posts = df_posts[['post_id', 'text', 'topic', 'top_all']].sort_values('top_all', ascending=False).reset_index().drop('index', axis=1) 
         for i in range(5):
             top = PostGet(
                 id = posts['post_id'].iloc[i],
@@ -148,7 +145,6 @@ def recommended_posts(id: int, time: datetime=datetime.now(), limit: int = 5) ->
         exp_group = df_user[df_user['user_id']==id]['exp_group'].values[0]
         timestamp_delta = (time - df_user[df_user['user_id']==id]['max'].item()).total_seconds()
         counter = (time - df_user[df_user['user_id']==id]['min'].item()).total_seconds()
-        delta = (time - df_user[df_user['user_id']==id]['max'].item()).total_seconds()
     #    os = df_user[df_user['user_id']==id]['os'].values[0]
     #    source = df_user[df_user['user_id']==id]['source'].values[0]
     #    lst_topic = df_user[df_user['user_id']==id]['lst_topic'].values[0]
@@ -158,7 +154,6 @@ def recommended_posts(id: int, time: datetime=datetime.now(), limit: int = 5) ->
         df['dayofweek'] = time.weekday()
         df['timestamp_delta'] = timestamp_delta
         df['counter'] = counter
-        df['delta'] = delta
         df['gender'] = gender
         df['age'] = age
         df['country'] = country
@@ -184,13 +179,16 @@ def recommended_posts(id: int, time: datetime=datetime.now(), limit: int = 5) ->
                                 6: 'tech'}
                 }
                    
-        
+                   
+        # Get rating of posts 
         probs = model.predict_proba(df[cols])[:, 1]
 
         posts = pd.concat([df[['post_id', 'text', 'topic', 'top_month']], pd.DataFrame(probs, columns=['Predict'])], axis=1).sort_values(by='Predict', ascending=False)
         posts['post_id'] = posts['post_id'].astype('int32')
         posts = posts.replace(back_text, inplace=False).reset_index().drop('index', axis=1)
 
+
+        # Make top of posts. If rating is less than 0.4 choose from best posts 
         top5 = []
         if posts['Predict'].iloc[4] >= 0.4:                
             for i in range(5):
@@ -201,7 +199,7 @@ def recommended_posts(id: int, time: datetime=datetime.now(), limit: int = 5) ->
                 )
                 top5.append(top)
         else:
-            posts = posts.sort_values('top_month', ascending=False).reset_index().drop('index', axis=1)
+            posts = posts.sort_values('top_all', ascending=False).reset_index().drop('index', axis=1)
             for i in range(5):
                 top = PostGet(
                     id = posts['post_id'].iloc[i],
